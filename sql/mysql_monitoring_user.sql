@@ -1,0 +1,9 @@
+CREATE
+USER IF NOT EXISTS 'mysqld_exporter'@'%' IDENTIFIED BY 'exporter_password'
+    WITH MAX_USER_CONNECTIONS 5;
+GRANT PROCESS, REPLICATION
+CLIENT,
+SELECT
+ON *.* TO 'mysqld_exporter'@'%';
+FLUSH
+PRIVILEGES;
