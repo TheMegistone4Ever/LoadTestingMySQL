@@ -83,6 +83,12 @@ run_load_test.py                            │                    ▼
                                                            Grafana :3000
 ```
 
+Entity-relationship diagram of the `parcel_delivery` database:
+<img src="diagrams/parcels.svg" alt="ERD of the parcel_delivery database" width="100%">
+
+```
+
+
 ## 2 Prerequisites
 
 | Component      | Purpose                                     |
