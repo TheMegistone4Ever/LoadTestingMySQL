@@ -1,0 +1,548 @@
+import random
+import time
+from dataclasses import replace
+from pathlib import Path
+
+import pymysql
+from gevent.event import Event
+from locust import LoadTestShape, User, constant, events, task
+from locust.runners import MasterRunner, WorkerRunner
+
+from console_encoding import enable_utf8_console_output
+from database_connection_settings import open_database_connection
+from load_test_plan import (
+    BRANCH_PARCELS_TRANSACTION,
+    CREATE_PARCEL_TRANSACTION,
+    DATABASE_CONNECTION_FAILURE_NAME,
+    DEFAULT_PLAN_NAME,
+    LOAD_TEST_PLANS,
+    RAMP_GRACE_SECONDS,
+    RECIPIENT_PARCELS_TRANSACTION,
+    REDIRECT_PARCEL_TRANSACTION,
+    SCAN_EVENT_TRANSACTION,
+    SPAWN_RATE_CLIENTS_PER_SECOND,
+    TRACKING_HISTORY_TRANSACTION,
+    TRACK_PARCEL_TRANSACTION,
+)
+from load_test_requirements_check import LoadTestResultsRecorder
+from parcel_dataset_specification import LOAD_TEST_TRACKING_NUMBER_PREFIX, TRACKING_NUMBER_SPACE, build_tracking_number
+from prometheus_metrics_exporter import start_metrics_exporter
+
+enable_utf8_console_output()
+
+DEFAULT_METRICS_PORT = 9646
+DEFAULT_RESULTS_DIRECTORY = "load_test_results"
+ACTIVE_PARCEL_POOL_WIDTH = 400_000
+NEXT_SCAN_STATUS = {"created": "accepted", "accepted": "in_transit", "in_transit": "arrived", "arrived": "delivered"}
+ORIGIN_BRANCH_STATUSES = ("accepted", "in_transit")
+PARCEL_PICK_ATTEMPTS = 5
+DUPLICATE_KEY_ERROR_CODE = 1062
+CONNECTION_LOST_ERROR_CODES = (0, 2003, 2006, 2013, 2055)
+
+TRACK_PARCEL_SQL = """
+                   SELECT p.tracking_number,
+                          p.status,
+                          p.updated_at,
+                          p.weight_kg,
+                          p.delivery_cost,
+                          origin_city.name,
+                          destination_city.name,
+                          destination_branch.branch_number,
+                          destination_branch.address
+                   FROM parcels p
+                            JOIN branches origin_branch ON origin_branch.id = p.origin_branch_id
+                            JOIN cities origin_city ON origin_city.id = origin_branch.city_id
+                            JOIN branches destination_branch ON destination_branch.id = p.destination_branch_id
+                            JOIN cities destination_city ON destination_city.id = destination_branch.city_id
+                   WHERE p.tracking_number = %s \
+                   """
+TRACKING_HISTORY_SQL = """
+                       SELECT e.status, e.event_time, b.branch_type, b.branch_number, c.name
+                       FROM parcels p
+                                JOIN tracking_events e ON e.parcel_id = p.id
+                                JOIN branches b ON b.id = e.branch_id
+                                JOIN cities c ON c.id = b.city_id
+                       WHERE p.tracking_number = %s
+                       ORDER BY e.event_time \
+                       """
+RECIPIENT_PARCELS_SQL = """
+                        SELECT tracking_number, status, created_at, destination_branch_id
+                        FROM parcels
+                        WHERE recipient_id = %s
+                        ORDER BY created_at DESC LIMIT 20 \
+                        """
+BRANCH_PARCELS_SQL = """
+                     SELECT id, tracking_number, recipient_id, updated_at
+                     FROM parcels
+                     WHERE destination_branch_id = %s
+                       AND status = 'arrived'
+                     ORDER BY updated_at LIMIT 50 \
+                     """
+LOCK_PARCEL_SQL = "SELECT status, origin_branch_id, destination_branch_id FROM parcels WHERE id = %s FOR UPDATE"
+INSERT_TRACKING_EVENT_SQL = (
+    "INSERT INTO tracking_events (parcel_id, branch_id, status, event_time) VALUES (%s, %s, %s, NOW())"
+)
+UPDATE_PARCEL_STATUS_SQL = "UPDATE parcels SET status = %s, updated_at = NOW() WHERE id = %s"
+INSERT_PARCEL_SQL = """
+                    INSERT INTO parcels (tracking_number, sender_id, recipient_id, origin_branch_id,
+                                         destination_branch_id,
+                                         weight_kg, declared_value, delivery_cost, status, created_at, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'created', NOW(), NOW()) \
+                    """
+REDIRECT_PARCEL_SQL = """
+                      UPDATE parcels
+                      SET destination_branch_id = %s,
+                          updated_at            = NOW()
+                      WHERE id = %s
+                        AND status IN ('created', 'accepted', 'in_transit') \
+                      """
+ACTIVE_PARCELS_SQL = (
+    "SELECT id FROM parcels WHERE id BETWEEN %s AND %s AND status IN "
+    "('created', 'accepted', 'in_transit', 'arrived')"
+)
+
+worker_dataset = {}
+worker_dataset_is_loaded = Event()
+
+
+def find_last_seeded_parcel_id(cursor, parcels_last_id):
+    """Find the last parcel whose tracking number was generated by the seeding script.
+
+    Args:
+        cursor: Open MySQL cursor.
+        parcels_last_id: Largest parcel id in the table.
+
+    Returns:
+        Id of the last seeded parcel.
+    """
+
+    first_id, last_id = 1, parcels_last_id
+    while first_id < last_id:
+        middle_id = (first_id + last_id + 1) // 2
+        cursor.execute("SELECT tracking_number FROM parcels WHERE id = %s", (middle_id,))
+        row = cursor.fetchone()
+        if row and row[0] == build_tracking_number(middle_id):
+            first_id = middle_id
+        else:
+            last_id = middle_id - 1
+    return first_id
+
+
+def load_worker_dataset():
+    """Load id bounds, delivery branches and a pool of active parcels for this process.
+
+    Releases the clients waiting in on_start once the dataset is in place.
+    """
+
+    with open_database_connection(autocommit=True) as connection, connection.cursor() as cursor:
+        cursor.execute("SELECT MAX(id) FROM customers")
+        customers_last_id = cursor.fetchone()[0]
+        cursor.execute("SELECT MAX(id) FROM parcels")
+        parcels_last_id = cursor.fetchone()[0]
+        cursor.execute("SELECT id FROM branches WHERE branch_type <> 'sorting_hub'")
+        delivery_branch_ids = [row[0] for row in cursor.fetchall()]
+        seeded_parcels_last_id = find_last_seeded_parcel_id(cursor, parcels_last_id)
+        pool_first_id = random.randint(1, max(1, parcels_last_id - ACTIVE_PARCEL_POOL_WIDTH))
+        cursor.execute(ACTIVE_PARCELS_SQL, (pool_first_id, pool_first_id + ACTIVE_PARCEL_POOL_WIDTH))
+        active_parcel_ids = [row[0] for row in cursor.fetchall()]
+    worker_dataset.update(
+        customers_last_id=customers_last_id,
+        seeded_parcels_last_id=seeded_parcels_last_id,
+        delivery_branch_ids=delivery_branch_ids,
+        active_parcel_ids=active_parcel_ids,
+        finished_parcel_ids=set(),
+    )
+
+    worker_dataset_is_loaded.set()
+    print(f"[дані] клієнтів: {customers_last_id:,}, посилок із seed: {seeded_parcels_last_id:,}, "
+          f"активних посилок у пулі: {len(active_parcel_ids):,}")
+    if not active_parcel_ids:
+        print("[дані] ⚠ активних посилок не знайдено: сканування і переадресація працюватимуть "
+              "лише з посилками, створеними під час тесту")
+
+
+def pick_active_parcel_id():
+    """Pick a parcel that is still in delivery from the pool of this process.
+
+    Returns:
+        Parcel id, or None when the pool has no active parcels left.
+    """
+
+    active_parcel_ids = worker_dataset["active_parcel_ids"]
+    finished_parcel_ids = worker_dataset["finished_parcel_ids"]
+    for _attempt in range(PARCEL_PICK_ATTEMPTS):
+        if not active_parcel_ids:
+            return None
+        parcel_id = active_parcel_ids[random.randrange(len(active_parcel_ids))]
+        if parcel_id not in finished_parcel_ids:
+            return parcel_id
+    return None
+
+
+def track_parcel_transaction(connection):
+    """Read the parcel card by a random tracking number.
+
+    Args:
+        connection: Open MySQL connection.
+
+    Returns:
+        Number of returned rows.
+    """
+
+    tracking_number = build_tracking_number(random.randint(1, worker_dataset["seeded_parcels_last_id"]))
+    with connection.cursor() as cursor:
+        cursor.execute(TRACK_PARCEL_SQL, (tracking_number,))
+        return len(cursor.fetchall())
+
+
+def tracking_history_transaction(connection):
+    """Read the scan history of a random parcel.
+
+    Args:
+        connection: Open MySQL connection.
+
+    Returns:
+        Number of returned rows.
+    """
+
+    tracking_number = build_tracking_number(random.randint(1, worker_dataset["seeded_parcels_last_id"]))
+    with connection.cursor() as cursor:
+        cursor.execute(TRACKING_HISTORY_SQL, (tracking_number,))
+        return len(cursor.fetchall())
+
+
+def recipient_parcels_transaction(connection):
+    """Read the last parcels addressed to a random customer.
+
+    Args:
+        connection: Open MySQL connection.
+
+    Returns:
+        Number of returned rows.
+    """
+
+    with connection.cursor() as cursor:
+        cursor.execute(RECIPIENT_PARCELS_SQL, (random.randint(1, worker_dataset["customers_last_id"]),))
+        return len(cursor.fetchall())
+
+
+def branch_parcels_transaction(connection):
+    """Read the parcels waiting for pickup in a random branch.
+
+    Args:
+        connection: Open MySQL connection.
+
+    Returns:
+        Number of returned rows.
+    """
+
+    with connection.cursor() as cursor:
+        cursor.execute(BRANCH_PARCELS_SQL, (random.choice(worker_dataset["delivery_branch_ids"]),))
+        return len(cursor.fetchall())
+
+
+def register_scan_event_transaction(connection):
+    """Lock an active parcel, append its next scan event and move its status in one transaction.
+
+    Args:
+        connection: Open MySQL connection.
+
+    Returns:
+        Number of changed rows.
+    """
+
+    with connection.cursor() as cursor:
+        connection.begin()
+        for _attempt in range(PARCEL_PICK_ATTEMPTS):
+            parcel_id = pick_active_parcel_id()
+            if parcel_id is None:
+                break
+            cursor.execute(LOCK_PARCEL_SQL, (parcel_id,))
+            parcel = cursor.fetchone()
+            if parcel is None or parcel[0] not in NEXT_SCAN_STATUS:
+                worker_dataset["finished_parcel_ids"].add(parcel_id)
+                continue
+            current_status, origin_branch_id, destination_branch_id = parcel
+            next_status = NEXT_SCAN_STATUS[current_status]
+            branch_id = origin_branch_id if next_status in ORIGIN_BRANCH_STATUSES else destination_branch_id
+            cursor.execute(INSERT_TRACKING_EVENT_SQL, (parcel_id, branch_id, next_status))
+            cursor.execute(UPDATE_PARCEL_STATUS_SQL, (next_status, parcel_id))
+            connection.commit()
+            if next_status not in NEXT_SCAN_STATUS:
+                worker_dataset["finished_parcel_ids"].add(parcel_id)
+            return 2
+        connection.commit()
+        return 0
+
+
+def create_parcel_transaction(connection):
+    """Create a new parcel together with its first tracking event in one transaction.
+
+    Args:
+        connection: Open MySQL connection.
+
+    Returns:
+        Number of inserted rows.
+    """
+
+    customers_last_id = worker_dataset["customers_last_id"]
+    sender_id = random.randint(1, customers_last_id)
+    recipient_id = random.randint(1, customers_last_id)
+    while recipient_id == sender_id:
+        recipient_id = random.randint(1, customers_last_id)
+    origin_branch_id, destination_branch_id = random.sample(worker_dataset["delivery_branch_ids"], 2)
+    weight_kg = round(random.uniform(0.2, 20.0), 2)
+    declared_value = round(random.uniform(200.0, 5_000.0), 2)
+    delivery_cost = round(80 + 12 * weight_kg + 0.005 * declared_value, 2)
+    with connection.cursor() as cursor:
+        connection.begin()
+        for _attempt in range(PARCEL_PICK_ATTEMPTS):
+            tracking_number = f"{LOAD_TEST_TRACKING_NUMBER_PREFIX}{random.randrange(TRACKING_NUMBER_SPACE):012d}"
+            try:
+                cursor.execute(INSERT_PARCEL_SQL, (tracking_number, sender_id, recipient_id, origin_branch_id,
+                                                   destination_branch_id, weight_kg, declared_value, delivery_cost))
+                break
+            except pymysql.err.IntegrityError as error:
+                if error.args[0] != DUPLICATE_KEY_ERROR_CODE:
+                    raise
+        parcel_id = cursor.lastrowid
+        cursor.execute(INSERT_TRACKING_EVENT_SQL, (parcel_id, origin_branch_id, "created"))
+        connection.commit()
+    worker_dataset["active_parcel_ids"].append(parcel_id)
+    return 2
+
+
+def redirect_parcel_transaction(connection):
+    """Redirect an active parcel to another branch.
+
+    Args:
+        connection: Open MySQL connection.
+
+    Returns:
+        Number of changed rows.
+    """
+
+    parcel_id = pick_active_parcel_id()
+    if parcel_id is None:
+        return 0
+    with connection.cursor() as cursor:
+        return cursor.execute(REDIRECT_PARCEL_SQL, (random.choice(worker_dataset["delivery_branch_ids"]), parcel_id))
+
+
+class ParcelDeliveryDatabaseClient(User):
+    """One concurrent client that keeps its own MySQL connection and runs transactions without pauses."""
+
+    wait_time = constant(0)
+
+    def on_start(self):
+        """Wait for the dataset of this process, then open the MySQL connection of this client.
+
+        The master can order the spawn before the init hook has finished loading the dataset,
+        so the first clients have to wait instead of reading an empty worker_dataset.
+        """
+
+        worker_dataset_is_loaded.wait()
+        self.connection = None
+        self.open_connection()
+
+    def on_stop(self):
+        """Close the MySQL connection of this client."""
+
+        if self.connection is not None:
+            self.connection.close()
+            self.connection = None
+
+    def open_connection(self):
+        """Connect to MySQL and report a refused connection as a failed request."""
+
+        started_at = time.perf_counter()
+        try:
+            self.connection = open_database_connection(autocommit=True)
+        except pymysql.err.MySQLError as error:
+            self.connection = None
+            self.environment.events.request.fire(
+                request_type="CONNECT", name=DATABASE_CONNECTION_FAILURE_NAME,
+                response_time=(time.perf_counter() - started_at) * 1000, response_length=0, exception=error,
+                context={})
+
+    def recover_from_error(self, error):
+        """Roll back the transaction, and drop the connection when the link to MySQL is broken.
+
+        Args:
+            error: Error raised by the transaction.
+        """
+
+        error_code = error.args[0] if error.args else 0
+        if error_code in CONNECTION_LOST_ERROR_CODES:
+            try:
+                self.connection.close()
+            except pymysql.err.MySQLError:
+                pass
+            self.connection = None
+            return
+        try:
+            self.connection.rollback()
+        except pymysql.err.MySQLError:
+            self.connection = None
+
+    def run_transaction(self, transaction_name, transaction_function):
+        """Run one transaction, measure it and report the result to Locust.
+
+        Every error is reported as a failed request, not only a MySQL one: an error that escapes
+        this method is counted neither as a request nor as a failure and disappears from the report.
+
+        Args:
+            transaction_name: Name shown in the reports and in Grafana.
+            transaction_function: Callable that takes the connection and returns the changed row count.
+        """
+
+        if self.connection is None:
+            self.open_connection()
+            if self.connection is None:
+                time.sleep(1)
+                return
+        started_at = time.perf_counter()
+        failure = None
+        changed_rows = 0
+        try:
+            changed_rows = transaction_function(self.connection)
+        except pymysql.err.MySQLError as error:
+            failure = error
+            self.recover_from_error(error)
+        except Exception as error:
+            failure = error
+        self.environment.events.request.fire(
+            request_type="SQL", name=transaction_name, response_time=(time.perf_counter() - started_at) * 1000,
+            response_length=changed_rows, exception=failure, context={})
+
+    @task(35)
+    def track_parcel(self):
+        """Track a parcel by its tracking number."""
+
+        self.run_transaction(TRACK_PARCEL_TRANSACTION, track_parcel_transaction)
+
+    @task(15)
+    def read_tracking_history(self):
+        """Read the movement history of a parcel."""
+
+        self.run_transaction(TRACKING_HISTORY_TRANSACTION, tracking_history_transaction)
+
+    @task(10)
+    def read_recipient_parcels(self):
+        """Read the parcels of a recipient."""
+
+        self.run_transaction(RECIPIENT_PARCELS_TRANSACTION, recipient_parcels_transaction)
+
+    @task(10)
+    def read_branch_parcels(self):
+        """Read the parcels waiting in a branch."""
+
+        self.run_transaction(BRANCH_PARCELS_TRANSACTION, branch_parcels_transaction)
+
+    @task(15)
+    def register_scan_event(self):
+        """Register a scan of a parcel in a branch."""
+
+        self.run_transaction(SCAN_EVENT_TRANSACTION, register_scan_event_transaction)
+
+    @task(10)
+    def create_parcel(self):
+        """Create a new parcel."""
+
+        self.run_transaction(CREATE_PARCEL_TRANSACTION, create_parcel_transaction)
+
+    @task(5)
+    def redirect_parcel(self):
+        """Redirect a parcel to another branch."""
+
+        self.run_transaction(REDIRECT_PARCEL_TRANSACTION, redirect_parcel_transaction)
+
+
+class ParcelDeliveryLoadPlan(LoadTestShape):
+    """Runs the stages of пункт 3 and measures only their steady part, after the ramp-up."""
+
+    def __init__(self):
+        super().__init__()
+        self.stages = ()
+        self.results_recorder = None
+        self.stage_index = 0
+        self.stage_started_at = 0.0
+        self.steady_started_at = None
+        self.current_stage_name = "—"
+
+    def prepare_plan(self):
+        """Apply the command line overrides of the plan, of the stage list and of the stage duration."""
+
+        options = self.runner.environment.parsed_options
+        planned_stages = LOAD_TEST_PLANS[options.plan]
+        selected_names = [name.strip() for name in (options.stages or "").split(",") if name.strip()]
+        stages = [stage for stage in planned_stages if not selected_names or stage.name in selected_names]
+        if options.minutes_per_stage:
+            stages = [replace(stage, steady_minutes=options.minutes_per_stage) for stage in stages]
+        self.stages = tuple(stages)
+        self.results_recorder = LoadTestResultsRecorder(Path(options.results_directory))
+
+    def tick(self):
+        """Return the client count of the current stage, or None when the plan is finished.
+
+        Returns:
+            Tuple of clients and spawn rate, or None at the end of the plan.
+        """
+
+        if self.results_recorder is None:
+            self.prepare_plan()
+        if self.stage_index >= len(self.stages):
+            return None
+        stage = self.stages[self.stage_index]
+        self.current_stage_name = stage.name
+        run_time = self.get_run_time()
+        if self.steady_started_at is None:
+            ramp_limit = stage.concurrent_clients / SPAWN_RATE_CLIENTS_PER_SECOND + RAMP_GRACE_SECONDS
+            if self.runner.user_count >= stage.concurrent_clients or run_time - self.stage_started_at > ramp_limit:
+                self.steady_started_at = run_time
+                self.results_recorder.start_stage(stage, self.runner.stats)
+        elif run_time - self.steady_started_at >= stage.steady_minutes * 60:
+            self.results_recorder.finish_stage(self.runner.stats, run_time - self.steady_started_at)
+            self.stage_index += 1
+            self.stage_started_at = run_time
+            self.steady_started_at = None
+            if self.stage_index >= len(self.stages):
+                self.results_recorder.write_reports()
+                self.current_stage_name = "завершено"
+                return None
+            stage = self.stages[self.stage_index]
+        return stage.concurrent_clients, SPAWN_RATE_CLIENTS_PER_SECOND
+
+
+@events.init_command_line_parser.add_listener
+def add_load_test_arguments(parser):
+    """Add the plan overrides and the exporter port to the Locust command line.
+
+    Args:
+        parser: Locust command line parser.
+    """
+
+    parser.add_argument("--metrics-port", type=int, default=DEFAULT_METRICS_PORT,
+                        help="порт експортера метрик для Prometheus")
+    parser.add_argument("--plan", type=str, default=DEFAULT_PLAN_NAME, choices=sorted(LOAD_TEST_PLANS),
+                        help="requirements — етапи вимог (пункт 3); saturation — згущені сходи для пошуку перегину")
+    parser.add_argument("--minutes-per-stage", type=float, default=0.0,
+                        help="скоротити кожен етап до N хв (0 — тривалість із вимог)")
+    parser.add_argument("--stages", type=str, default="",
+                        help="перелік етапів через кому (порожньо — весь план)")
+    parser.add_argument("--results-directory", type=str, default=DEFAULT_RESULTS_DIRECTORY,
+                        help="каталог для результатів етапів")
+
+
+@events.init.add_listener
+def prepare_process(environment, **_keyword_arguments):
+    """Start the metrics exporter on the master and load the dataset in load-generating processes.
+
+    Args:
+        environment: Locust environment of this process.
+    """
+
+    if not isinstance(environment.runner, WorkerRunner):
+        start_metrics_exporter(environment, environment.parsed_options.metrics_port)
+    if not isinstance(environment.runner, MasterRunner):
+        load_worker_dataset()

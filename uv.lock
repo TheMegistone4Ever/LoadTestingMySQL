@@ -644,6 +644,7 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "faker" },
+    { name = "gevent" },
     { name = "locust" },
     { name = "prometheus-client" },
     { name = "psutil" },
@@ -653,6 +654,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "faker", specifier = ">=40.40" },
+    { name = "gevent", specifier = ">=26.9" },
     { name = "locust", specifier = ">=2.46" },
     { name = "prometheus-client", specifier = ">=0.21" },
     { name = "psutil", specifier = ">=6.0" },
