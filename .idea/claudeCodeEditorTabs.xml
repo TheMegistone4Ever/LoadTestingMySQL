@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="ClaudeCodeEditorTabs">
+    <option name="activeSessionId" value="7f1cbfcc-ea16-4fe6-9db0-2dbb210e8c3f" />
+    <option name="openSessionIds">
+      <list>
+        <option value="b243cd92-76c1-41c5-851f-8b61ce12d61e" />
+        <option value="7f1cbfcc-ea16-4fe6-9db0-2dbb210e8c3f" />
+      </list>
+    </option>
+    <option name="sessionPaths">
+      <map>
+        <entry key="7f1cbfcc-ea16-4fe6-9db0-2dbb210e8c3f" value="/sessions/5aa149dc-6686-4380-9a28-12c574254308" />
+        <entry key="b243cd92-76c1-41c5-851f-8b61ce12d61e" value="/sessions/3c0956a1-7a20-401a-997a-eea0bea293e5" />
+      </map>
+    </option>
+    <option name="sessionTitles">
+      <map>
+        <entry key="7f1cbfcc-ea16-4fe6-9db0-2dbb210e8c3f" value="Скажи, як запустити все: які команди виконати по ч" />
+        <entry key="b243cd92-76c1-41c5-851f-8b61ce12d61e" value="Зроби все те ж саме тільки локально - зараз ми не" />
+      </map>
+    </option>
+  </component>
+</project>
