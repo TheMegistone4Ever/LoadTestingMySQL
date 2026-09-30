@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: parcel-delivery-load-testing
+    folder: Load Testing
+    type: file
+    disableDeletion: false
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false
