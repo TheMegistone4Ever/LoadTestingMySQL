@@ -1,0 +1,48 @@
+services:
+  prometheus:
+    image: prom/prometheus:v3.14.0
+    container_name: parcel_delivery_prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  mysqld_exporter:
+    image: prom/mysqld-exporter:v0.20.0
+    container_name: parcel_delivery_mysqld_exporter
+    command:
+      - --mysqld.address=${MYSQLD_EXPORTER_TARGET:-mysql:3306}
+      - --mysqld.username=mysqld_exporter
+      - --collect.info_schema.innodb_metrics
+    environment:
+      MYSQLD_EXPORTER_PASSWORD: ${MYSQLD_EXPORTER_PASSWORD:-exporter_password}
+    ports:
+      - "9104:9104"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  grafana:
+    image: grafana/grafana:13.2.2
+    container_name: parcel_delivery_grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_DEFAULT_THEME: light
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+
+volumes:
+  prometheus_data:
+  grafana_data:

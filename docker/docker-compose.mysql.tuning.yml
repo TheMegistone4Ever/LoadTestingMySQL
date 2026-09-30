@@ -1,0 +1,23 @@
+services:
+  mysql:
+    command:
+      - --innodb-buffer-pool-size=${INNODB_BUFFER_POOL_SIZE:-8G}
+      - --innodb-redo-log-capacity=4G
+      - --max-connections=6000
+
+      - --innodb-read-io-threads=8
+      - --innodb-write-io-threads=8
+      - --innodb-io-capacity=4000
+      - --innodb-io-capacity-max=8000
+
+      - --innodb-flush-neighbors=0
+      - --innodb-buffer-pool-instances=16
+
+      - --skip-log-bin
+
+      - --innodb-flush-log-at-trx-commit=${INNODB_FLUSH_LOG_AT_TRX_COMMIT:-2}
+      - --innodb-log-buffer-size=256M
+
+      - --table-open-cache=8000
+      - --table-open-cache-instances=16
+      - --thread-cache-size=512

@@ -1,0 +1,41 @@
+services:
+  mysql:
+    image: mysql:9.7
+    container_name: parcel_delivery_mysql
+    command:
+      - --innodb-buffer-pool-size=${INNODB_BUFFER_POOL_SIZE:-8G}
+      - --innodb-redo-log-capacity=4G
+      - --max-connections=6000
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_PASSWORD:?поставте MYSQL_PASSWORD у файлі .env}
+      MYSQL_ROOT_HOST: "%"
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./sql/mysql_monitoring_user.sql:/docker-entrypoint-initdb.d/10_mysql_monitoring_user.sql:ro
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    healthcheck:
+      test: [ "CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${MYSQL_PASSWORD}" ]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+
+  phpmyadmin:
+    image: phpmyadmin:5.2
+    container_name: parcel_delivery_phpmyadmin
+    environment:
+      PMA_HOST: mysql
+      PMA_PORT: 3306
+    ports:
+      - "8080:80"
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+volumes:
+  mysql_data:
